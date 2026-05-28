@@ -4,6 +4,23 @@
 #import "FetchResourceModel.h"
 #import <Flutter/Flutter.h>
 
+// Container view that pins its single VAP subview to its bounds on every
+// layout pass. Flutter PlatformView containers often receive CGRectZero
+// initial bounds and get resized later — without this, QGVAPWrapView's
+// internal CAMetalLayer stays zero-sized and renders nothing.
+@interface VAPContainerView : UIView
+@property (nonatomic, weak) QGVAPWrapView *wrapView;
+@end
+
+@implementation VAPContainerView
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    if (self.wrapView) {
+        self.wrapView.frame = self.bounds;
+    }
+}
+@end
+
 @interface NativeVapView : NSObject <FlutterPlatformView, VAPWrapViewDelegate>
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -37,7 +54,7 @@
 @end
 
 @implementation NativeVapView {
-    UIView *_view;
+    VAPContainerView *_view;
     QGVAPWrapView *_wrapView;
     BOOL playStatus;
     FlutterMethodChannel *_methodChannel;
@@ -52,7 +69,8 @@
     _args = args;
     if (self) {
         playStatus = NO;
-        _view = [[UIView alloc] initWithFrame:frame];
+        _view = [[VAPContainerView alloc] initWithFrame:frame];
+        _view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         
 
         
@@ -176,18 +194,38 @@
 #pragma mark - Playback Control
 
 - (void)playByPath:(NSString *)path withResult:(FlutterResult)result {
-    // Reuse the same QGVAPWrapView across plays. Upstream allocated a new
-    // wrap view on every call which (combined with autoDestoryAfterFinish=YES)
-    // produced a visible black frame on every loop boundary while the Metal
-    // surface tore down + re-attached. With autoDestoy=NO and a persistent
-    // wrap view, the loop is seamless.
+    // Force a layout pass before allocating the wrap view. Flutter
+    // PlatformView containers frequently get CGRectZero at init and grow
+    // to their real size on the next layout cycle. If we allocate
+    // QGVAPWrapView while bounds are zero, its internal CAMetalLayer is
+    // created at zero size and renders nothing — visible to the user as
+    // "asset never appears" / "blank for the whole session" randomness.
+    [_view layoutIfNeeded];
+
+    // Reuse the same QGVAPWrapView across plays. Upstream allocated a
+    // new wrap view on every call which (combined with
+    // autoDestoryAfterFinish=YES) produced a visible black frame on
+    // every loop boundary while the Metal surface tore down + re-
+    // attached. With autoDestoy=NO + persistent wrap view, the loop is
+    // seamless.
     if (!_wrapView) {
         _wrapView = [[QGVAPWrapView alloc] initWithFrame:_view.bounds];
-        _wrapView.center = _view.center;
-        _wrapView.contentMode = QGVAPWrapViewContentModeAspectFit;
+        // Map the Dart-side scaleType to the matching VAP content mode.
+        // Previously this argument was ignored and AspectFit was always
+        // used — callers had to wrap the VapView in Transform.scale() to
+        // compensate for the visual mismatch.
+        NSString *scaleType = _args[@"scaleType"];
+        if ([scaleType isEqualToString:@"CENTER_CROP"]) {
+            _wrapView.contentMode = QGVAPWrapViewContentModeAspectFill;
+        } else if ([scaleType isEqualToString:@"FIT_XY"]) {
+            _wrapView.contentMode = QGVAPWrapViewContentModeScaleToFill;
+        } else {
+            _wrapView.contentMode = QGVAPWrapViewContentModeAspectFit;
+        }
         _wrapView.autoDestoryAfterFinish = NO;
         _wrapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [_view addSubview:_wrapView];
+        _view.wrapView = _wrapView; // VAPContainerView.layoutSubviews resizes wrapView on bounds changes
     } else if (playStatus) {
         [_wrapView stopHWDMP4];
     }
@@ -201,7 +239,12 @@
     // reissue play on onComplete.
     [_wrapView vapWrapView_playHWDMP4:path repeatCount:-1 delegate:self];
     result(nil);
-    [_methodChannel invokeMethod:@"onStart" arguments:@{@"status" : @"start"}];
+    // NOTE: No synthetic onStart here. The delegate callback
+    // vapWrap_viewDidStartPlayMP4 fires when the decoder is actually
+    // ready. Sending an early synthetic onStart caused the app's
+    // placeholder to hide before the first frame reached the Metal
+    // layer, producing the "asset shows for a fraction of a second
+    // then disappears forever" symptom on iOS.
 }
 
 - (void)stopPlayback {
