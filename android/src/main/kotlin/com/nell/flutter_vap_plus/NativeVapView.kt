@@ -46,14 +46,24 @@ internal class NativeVapView(
         // listener-in-attach pattern silently dropped onStart / onComplete
         // events on older devices.
         //
-        // Loop semantics (Tencent VAP AnimView.setLoop):
+        // Loop semantics:
         //   N > 0  → play N times
-        //   0      → infinite loop
-        // Accept -1 too for callers using the old upstream "-1 = infinite"
-        // convention.
+        //   <= 0   → infinite loop
+        //
+        // Tencent VAP 2.0.28 HardDecoder.kt:251 treats setLoop(0) as
+        // "exhausted" — playLoop is decremented to -1 on EOS, outputDone
+        // becomes true, the decoder + surface are released, and
+        // onVideoComplete fires after a single cycle. Public doc claiming
+        // 0 = infinite is wrong for this version.
+        //
+        // For true seamless infinite loop we set Int.MAX_VALUE. The
+        // decoder then hits the `loop > 0 → seekTo(0) + flush()` branch
+        // (HardDecoder.kt:277) — same MediaCodec instance, same
+        // TextureView surface, instant frame-0 restart. No teardown, no
+        // flicker, no Dart-side replay needed.
         val repeatCount = (creationParams?.get("repeatCount") as? Int) ?: 0
         if (repeatCount <= 0) {
-            vapView.setLoop(0) // native infinite, no Dart-side replay needed
+            vapView.setLoop(Int.MAX_VALUE)
         } else {
             vapView.setLoop(repeatCount)
         }
