@@ -176,37 +176,41 @@
 #pragma mark - Playback Control
 
 - (void)playByPath:(NSString *)path withResult:(FlutterResult)result {
-    if (playStatus) {
-        result([FlutterError errorWithCode:@"ALREADY_PLAYING"
-                                   message:@"A video is already playing"
-                                   details:nil]);
-        return;
+    // Reuse the same QGVAPWrapView across plays. Upstream allocated a new
+    // wrap view on every call which (combined with autoDestoryAfterFinish=YES)
+    // produced a visible black frame on every loop boundary while the Metal
+    // surface tore down + re-attached. With autoDestoy=NO and a persistent
+    // wrap view, the loop is seamless.
+    if (!_wrapView) {
+        _wrapView = [[QGVAPWrapView alloc] initWithFrame:_view.bounds];
+        _wrapView.center = _view.center;
+        _wrapView.contentMode = QGVAPWrapViewContentModeAspectFit;
+        _wrapView.autoDestoryAfterFinish = NO;
+        _wrapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [_view addSubview:_wrapView];
+    } else if (playStatus) {
+        [_wrapView stopHWDMP4];
     }
 
     playStatus = YES;
-    _wrapView = [[QGVAPWrapView alloc] initWithFrame:_view.bounds];
-    
-    _wrapView.center = _view.center;
-    _wrapView.contentMode = QGVAPWrapViewContentModeAspectFit;
-    _wrapView.autoDestoryAfterFinish = YES;
-    
-    [_view addSubview:_wrapView];
-    [_wrapView vapWrapView_playHWDMP4:path repeatCount:0 delegate:self];
-//    [_wrapView playHWDMp4:path repeatCount:0 delegate:self];
-
-//    [_wrapView playHWDMP4:path repeatCount:0 delegate:self];
-    // Optionally, you can notify Flutter that playback has started
+    // repeatCount semantics on Tencent VAP iOS (QGHWDMetalView):
+    //   -1 → infinite loop
+    //    0 → play once
+    //    N → play N+1 times
+    // Pass -1 so the native side loops forever and Dart never has to
+    // reissue play on onComplete.
+    [_wrapView vapWrapView_playHWDMP4:path repeatCount:-1 delegate:self];
     result(nil);
     [_methodChannel invokeMethod:@"onStart" arguments:@{@"status" : @"start"}];
 }
 
 - (void)stopPlayback {
     if (_wrapView) {
+        [_wrapView stopHWDMP4];
         [_wrapView removeFromSuperview];
         _wrapView = nil;
     }
     playStatus = NO;
-
 }
 
 #pragma mark - VAPWrapViewDelegate

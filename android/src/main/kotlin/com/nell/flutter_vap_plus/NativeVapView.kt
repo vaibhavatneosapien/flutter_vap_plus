@@ -7,7 +7,6 @@ import android.util.Log
 import android.view.View
 import com.tencent.qgame.animplayer.AnimConfig
 import com.tencent.qgame.animplayer.AnimView
-import com.tencent.qgame.animplayer.Constant
 import com.tencent.qgame.animplayer.inter.IAnimListener
 import com.tencent.qgame.animplayer.util.ScaleType
 import com.tencent.qgame.animplayer.inter.IFetchResource
@@ -35,30 +34,29 @@ internal class NativeVapView(
     private val channel: MethodChannel =
         MethodChannel(binaryMessenger, "flutter_vap_controller_${id}")
 
-
-    // 创建一个 CoroutineScope
     private var myScope: CoroutineScope? =
-        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) // 或者 Dispatchers.Default/I // O
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     init {
         channel.setMethodCallHandler(this)
-    }
 
-    override fun onFlutterViewAttached(flutterView: View) {
-        super.onFlutterViewAttached(flutterView)
-
-        /// 循环播放
-        val repeatCount = creationParams?.get("repeatCount") as Int
-        if (repeatCount == -1) {
-            vapView.setLoop(Int.MAX_VALUE)
-        }
-        else {
+        // setLoop + setScaleType + setAnimListener live in `init` rather
+        // than `onFlutterViewAttached`. Flutter virtual-display mode (API
+        // 21–22) never calls onFlutterViewAttached, so the upstream
+        // listener-in-attach pattern silently dropped onStart / onComplete
+        // events on older devices.
+        //
+        // Loop semantics (Tencent VAP AnimView.setLoop):
+        //   N > 0  → play N times
+        //   0      → infinite loop
+        // Accept -1 too for callers using the old upstream "-1 = infinite"
+        // convention.
+        val repeatCount = (creationParams?.get("repeatCount") as? Int) ?: 0
+        if (repeatCount <= 0) {
+            vapView.setLoop(0) // native infinite, no Dart-side replay needed
+        } else {
             vapView.setLoop(repeatCount)
         }
-
-        vapView.enableVersion1(true)
-
-        vapView.setVideoMode(Constant.VIDEO_MODE_SPLIT_HORIZONTAL_REVERSE)
 
         vapView.setScaleType(
             ScaleType.valueOf(
@@ -72,31 +70,22 @@ internal class NativeVapView(
                     "errorType" to errorType,
                     "errorMsg" to (errorMsg ?: "unknown error")
                 )
-                Log.d("TAG", "Anim onFailed: $errorInfo")
+                Log.d("flutter_vap", "Anim onFailed: $errorInfo")
                 myScope?.launch {
-                    channel.invokeMethod(
-                        "onFailed",
-                        errorInfo
-                    )
+                    channel.invokeMethod("onFailed", errorInfo)
                 }
-
             }
 
             override fun onVideoComplete() {
-//                myScope?.launch {
-//                    eventSink?.success(mapOf("status" to "complete"))
-//                }
                 myScope?.launch {
                     channel.invokeMethod(
                         "onComplete",
                         mapOf("status" to "complete")
                     )
                 }
-
             }
 
             override fun onVideoDestroy() {
-                // Handle video destroy if necessary
                 myScope?.launch {
                     channel.invokeMethod(
                         "onDestroy",
@@ -106,27 +95,15 @@ internal class NativeVapView(
             }
 
             override fun onVideoRender(frameIndex: Int, config: AnimConfig?) {
-                // Handle video render if necessary
-//                myScope?.launch {
-//                    channel.invokeMethod(
-//                        "onRender",
-//                        mapOf(
-//                            "status" to "render",
-//                            "frameIndex" to frameIndex,
-////                    "config" to config
-//                        )
-//                    )
-//                }
+                // no-op
             }
 
             override fun onVideoStart() {
-                // Handle video start if necessary
                 myScope?.launch {
                     channel.invokeMethod("onStart", mapOf("status" to "start"))
                 }
             }
         })
-
     }
 
     override fun getView(): View {
@@ -134,18 +111,23 @@ internal class NativeVapView(
     }
 
     override fun dispose() {
+        vapView.stopPlay()
         channel.setMethodCallHandler(null)
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-        Log.d("TAG", "onMethodCall: ${call.method}")
+        Log.d("flutter_vap", "onMethodCall: ${call.method}")
         when (call.method) {
             "playPath" -> {
                 val path = call.argument<String>("path")
                 if (path != null) {
+                    // stopPlay() before startPlay() — if the caller
+                    // restarts mid-loop (rare with setLoop(0) but possible
+                    // on lifecycle changes), avoid the "starts but never
+                    // advances" half-state.
+                    vapView.stopPlay()
                     vapView.startPlay(File(path))
                     result.success(null)
-
                 } else {
                     result.error("INVALID_ARGUMENT", "Path is null", null)
                 }
@@ -154,6 +136,7 @@ internal class NativeVapView(
             "playAsset" -> {
                 val asset = call.argument<String>("asset")
                 if (asset != null) {
+                    vapView.stopPlay()
                     vapView.startPlay(mContext.assets, "flutter_assets/$asset")
                     result.success(null)
                 } else {
@@ -169,13 +152,10 @@ internal class NativeVapView(
             "setFetchResource" -> {
                 val rawJson = call.arguments.toString()
                 val list: List<FetchResourceModel> = parseJsonToFetchResourceModelList(rawJson)
-
                 vapView.setFetchResource(
-                    fetchResource = FetchResources(
-                        resources = list
-                    )
+                    fetchResource = FetchResources(resources = list)
                 )
-                result.success(null);
+                result.success(null)
             }
 
             else -> {
@@ -183,7 +163,6 @@ internal class NativeVapView(
             }
         }
     }
-
 
     private fun parseJsonToFetchResourceModelList(rawJson: String): List<FetchResourceModel> {
         val list = mutableListOf<FetchResourceModel>()
@@ -193,9 +172,7 @@ internal class NativeVapView(
                 val jsonObject = jsonArray.getJSONObject(i)
                 val tag = jsonObject.getString("tag")
                 val resource = jsonObject.getString("resource")
-
-                val resourceModel = FetchResourceModel(tag,resource)
-                list.add(resourceModel)
+                list.add(FetchResourceModel(tag, resource))
             }
         } catch (e: Exception) {
             println("JSON parsing error: ${e.message}")
@@ -211,26 +188,23 @@ internal class FetchResources(
     private val resources: List<FetchResourceModel>
 ) : IFetchResource {
 
-
     override fun fetchImage(resource: Resource, result: (Bitmap?) -> Unit) {
-        Log.d("TAG", "fetchResource: fetchImage ${resource.tag} -- $resources")
+        Log.d("flutter_vap", "fetchResource: fetchImage ${resource.tag} -- $resources")
         resources.firstOrNull {
             it.tag == resource.tag
         }?.let {
-            Log.d("TAG", "fetchImage: result ${it.resource}")
+            Log.d("flutter_vap", "fetchImage: result ${it.resource}")
             result(BitmapFactory.decodeFile(it.resource))
         } ?: result(null)
     }
 
     override fun fetchText(resource: Resource, result: (String?) -> Unit) {
-        Log.d("TAG", "fetchResource: fetchText ${resource.tag}")
-
+        Log.d("flutter_vap", "fetchResource: fetchText ${resource.tag}")
         result(
             resources.firstOrNull {
                 it.tag == resource.tag
             }?.resource
         )
-
     }
 
     override fun releaseResource(resources: List<Resource>) {
@@ -241,12 +215,8 @@ internal class FetchResources(
 }
 
 internal class FetchResourceModel(
-    /// vap资源文件中预设的tag
     val tag: String,
-    /// 图片本地路径或者文本字符串
     val resource: String,
-
-
 ) {
     override fun toString(): String {
         return mapOf(
