@@ -23,8 +23,13 @@ class VapController {
           FetchResourceModel> fetchResources = const []}) async {
     try {
       playCompleter = Completer<void>();
-      /// 先设置融合动画参数再播放，不然会出现融合动画不起作用的问题
-      await setFetchResources(fetchResources);
+      // Skip the empty-list roundtrip — adds a noticeable method-channel
+      // hop on iOS cold start before native playback can even begin, and
+      // the native side has no merged-animation resources to configure
+      // when the list is empty anyway.
+      if (fetchResources.isNotEmpty) {
+        await setFetchResources(fetchResources);
+      }
 
       await _methodChannel.invokeMethod(playMethod, {playArg: source});
 
