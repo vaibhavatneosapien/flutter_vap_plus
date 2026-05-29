@@ -11,18 +11,21 @@ class VapViewForIos extends StatelessWidget {
   final void Function(VapController controller) onControllerCreated;
   final VapScaleFit fit;
   final void Function(dynamic event, dynamic arguments)? onEvent;
+  final double? centerCropZoom;
 
   const VapViewForIos({
     super.key,
     required this.onControllerCreated,
     required this.fit,
     this.onEvent,
+    this.centerCropZoom,
   });
 
   @override
   Widget build(BuildContext context) {
     final Map<String, dynamic> creationParams = <String, dynamic>{
       'scaleType': fit.name,
+      if (centerCropZoom != null) 'centerCropZoom': centerCropZoom,
     };
     return UiKitView(
       viewType: "flutter_vap",

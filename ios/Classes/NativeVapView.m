@@ -1,6 +1,7 @@
 #import "NativeVapView.h"
 #import "UIView+VAP.h"
 #import "QGVAPWrapView.h"
+#import "QGVAPConfigModel.h"
 #import "FetchResourceModel.h"
 #import <Flutter/Flutter.h>
 
@@ -8,8 +9,15 @@
 // layout pass. Flutter PlatformView containers often receive CGRectZero
 // initial bounds and get resized later — without this, QGVAPWrapView's
 // internal CAMetalLayer stays zero-sized and renders nothing.
+//
+// `onBoundsChanged` fires after every layout so the owning NativeVapView
+// can re-apply CENTER_CROP frame math against the new bounds. Required
+// because QGVAPWrapView's `p_setupContentModeWithConfig:` only runs once
+// (at shouldStartPlayMP4) — any subsequent bounds change from Flutter
+// leaves the inner VAPView at its initial size.
 @interface VAPContainerView : UIView
 @property (nonatomic, weak) QGVAPWrapView *wrapView;
+@property (nonatomic, copy) void (^onBoundsChanged)(void);
 @end
 
 @implementation VAPContainerView
@@ -17,6 +25,9 @@
     [super layoutSubviews];
     if (self.wrapView) {
         self.wrapView.frame = self.bounds;
+    }
+    if (self.onBoundsChanged) {
+        self.onBoundsChanged();
     }
 }
 @end
@@ -60,6 +71,13 @@
     FlutterMethodChannel *_methodChannel;
     NSArray<FetchResourceModel *> *_fetchResources;
     id _args;
+    // Cached state for CENTER_CROP layout. `_innerVapView` is the VAPView
+    // owned by QGVAPWrapView; it's a private subview so we capture it from
+    // the `vapWrap_viewshouldStartPlayMP4:config:` callback. `_lastSize`
+    // and `_lastVideoRatio` are cached from VAPC info so the bounds-change
+    // recompute doesn't need the config dict again.
+    __weak VAPView *_innerVapView;
+    CGSize _lastVideoSize;
 }
 - (instancetype)initWithFrame:(CGRect)frame
                viewIdentifier:(int64_t)viewId
@@ -71,6 +89,10 @@
         playStatus = NO;
         _view = [[VAPContainerView alloc] initWithFrame:frame];
         _view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        __weak typeof(self) weakSelfForLayout = self;
+        _view.onBoundsChanged = ^{
+            [weakSelfForLayout applyCenterCropLayoutIfNeeded];
+        };
         
 
         
@@ -256,7 +278,75 @@
     playStatus = NO;
 }
 
+#pragma mark - CENTER_CROP layout
+
+// QGVAPWrapView's built-in `p_setupContentModeWithConfig:` only fires once
+// (from inside its own shouldStartPlayMP4) and uses `info.size` to lay out
+// the inner VAPView. Two reasons we re-implement it here for CENTER_CROP:
+//
+//   1) Bounds race. shouldStartPlayMP4 fires during decoder init, which
+//      can be before Flutter has settled the platform-view's final size.
+//      If the wrap view's bounds are still small at that moment, the
+//      computed inner frame is wrong and stays wrong (the wrap view does
+//      not re-run contentMode on subsequent layout). Recomputing on every
+//      VAPContainerView.layoutSubviews fixes this.
+//
+//   2) Visual calibration. Callers may need an additional zoom factor on
+//      top of standard CENTER_CROP (e.g. to crop further into the source
+//      so a centered pendant fills the container the way a designer's
+//      placeholder image does). The Dart side passes `centerCropZoom`;
+//      this hook multiplies the standard cover-scale by that factor.
+- (void)applyCenterCropLayoutIfNeeded {
+    if (!_innerVapView || !_wrapView) {
+        return;
+    }
+    NSString *scaleType = _args[@"scaleType"];
+    if (![scaleType isEqualToString:@"CENTER_CROP"]) {
+        return;
+    }
+    CGFloat layoutWidth = _wrapView.bounds.size.width;
+    CGFloat layoutHeight = _wrapView.bounds.size.height;
+    CGFloat sourceWidth = _lastVideoSize.width;
+    CGFloat sourceHeight = _lastVideoSize.height;
+    if (layoutWidth <= 0 || layoutHeight <= 0 || sourceWidth <= 0 || sourceHeight <= 0) {
+        return;
+    }
+
+    // Standard "cover": scale source so the shorter-fit dimension still
+    // fully covers its matching container dimension; longer dimension
+    // overflows and is clipped by the platform-view bounds. Equivalent to
+    // Android's CENTER_CROP / Flutter's BoxFit.cover.
+    CGFloat scale = MAX(layoutWidth / sourceWidth, layoutHeight / sourceHeight);
+
+    NSNumber *zoomNumber = _args[@"centerCropZoom"];
+    CGFloat zoom = zoomNumber ? [zoomNumber doubleValue] : 1.0;
+    if (zoom <= 0) {
+        zoom = 1.0;
+    }
+    scale *= zoom;
+
+    CGFloat targetWidth = sourceWidth * scale;
+    CGFloat targetHeight = sourceHeight * scale;
+    _innerVapView.frame = CGRectMake(
+        (layoutWidth - targetWidth) / 2.0,
+        (layoutHeight - targetHeight) / 2.0,
+        targetWidth,
+        targetHeight
+    );
+}
+
 #pragma mark - VAPWrapViewDelegate
+
+- (BOOL)vapWrap_viewshouldStartPlayMP4:(VAPView *)container config:(QGVAPConfigModel *)config {
+    // Capture references QGVAPWrapView keeps private. `container` is the
+    // VAPView that hosts the Metal layer; `config.info.size` is the VAPC
+    // rgbFrame size (the rendered output dimensions, not the encoded
+    // dimensions which include the alpha-channel region).
+    _innerVapView = container;
+    _lastVideoSize = config.info.size;
+    [self applyCenterCropLayoutIfNeeded];
+    return YES;
+}
 
 - (void)vapWrap_viewDidStartPlayMP4:(VAPView *)container {
     playStatus = YES;
