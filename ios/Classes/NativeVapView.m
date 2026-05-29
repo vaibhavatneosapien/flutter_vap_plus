@@ -178,15 +178,16 @@
     } else if ([@"playAsset" isEqualToString:call.method]) {
         NSString *asset = call.arguments[@"asset"];
         if (asset) {
-//            NSString *assetPath = [[NSBundle mainBundle] pathForResource:asset ofType:nil];
-            NSString *flutterAssetsPath = [[NSBundle mainBundle] pathForResource:@"flutter_assets" ofType:nil];
-            
-                NSString *assetPath = [flutterAssetsPath stringByAppendingPathComponent:asset];
-            
-                NSLog(@"Asset path: %@", assetPath);
-            
-            
-            
+            // Resolve via FlutterDartProject. Previous code did
+            // `pathForResource:@"flutter_assets"` which returns nil on
+            // Flutter iOS — `flutter_assets` is a directory inside
+            // App.framework, not a bundled resource entry. The nil
+            // propagated through stringByAppendingPathComponent: producing
+            // a non-absolute path, which QGVAPlayer's NSFileManager
+            // existence check then rejected, leaving the platform view
+            // blank.
+            NSString *key = [FlutterDartProject lookupKeyForAsset:asset];
+            NSString *assetPath = key ? [[NSBundle mainBundle] pathForResource:key ofType:nil] : nil;
             if (assetPath) {
                 [self playByPath:assetPath withResult:result];
             } else {
